@@ -68,8 +68,8 @@ def run(argv=None):
     std = opts.view_as(StandardOptions)
     std.streaming = True
 
-    input_glob    = "gs://insider-lake-ingestion-br/muninn_backups/avro/public_ProductionOrders/*.avro"
-    output_prefix = "gs://insider-lake-ingestion-br/muninn_backups/parquet/public_ProductionOrders/"
+    input_glob    = "gs://insider-lake-ingestion-br/muninn_backups/avro/*.avro"
+    output_prefix = "gs://insider-lake-ingestion-br/muninn_backups/parquet/"
 
     with beam.Pipeline(options=opts) as p:
         files = (p
