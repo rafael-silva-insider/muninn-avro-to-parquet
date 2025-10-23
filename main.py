@@ -260,9 +260,13 @@ class AvroPathLogPyArrowSchema(beam.DoFn):
                         f.name, f.type, type(sample).__name__ if sample is not None else None, sample, fe
                     )
             raise  # repropaga para o Dataflow marcar a falha
+        
+        # extrai a pasta imediatamente após "avro/"
+        m = re.search(r'/avro/([^/]+)/', path)
+        folder = m.group(1) if m else "unknown"
 
         # Escreve Parquet particionado por ingestion_date
-        dest_path = f"{self.output_prefix}/ingestion_date={ingestion_date}/part-{uuid4().hex}.parquet"
+        dest_path = f"{self.output_prefix}/{folder}/ingestion_date={ingestion_date}/part-{uuid4().hex}.parquet"
         with FileSystems.create(dest_path) as sink:
             pq.write_table(table, sink, compression="snappy")
         logging.info("[PARQUET-WRITTEN] %s", dest_path)
