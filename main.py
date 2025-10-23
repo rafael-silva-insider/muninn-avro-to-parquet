@@ -13,6 +13,122 @@ from apache_beam.transforms.window import FixedWindows
 
 # ---------------- util: parse "30m", "1h", "2d" ----------------
 _UNIT_TO_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+def _stringify_any(x):
+    if x is None:
+        return None
+    if isinstance(x, (list, dict, tuple)):
+        try:
+            return json.dumps(x, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            return str(x)
+    return str(x)
+
+def _to_bool(x):
+    if x is None:
+        return None
+    if isinstance(x, bool):
+        return x
+    s = str(x).strip().lower()
+    if s in {"true","t","1","yes","y"}: return True
+    if s in {"false","f","0","no","n"}: return False
+    try:
+        return bool(int(s))
+    except Exception:
+        return None
+
+def _to_int(x):
+    if x is None: return None
+    if isinstance(x, bool): return int(x)
+    if isinstance(x, (int,)): return int(x)
+    if isinstance(x, float): return int(x)
+    s = str(x).strip()
+    if s.startswith("+"): s = s[1:]
+    return int(s)
+
+def _to_list_of_str(x):
+    if x is None: return None
+    if isinstance(x, (list, tuple)):
+        return [None if v is None else str(v) for v in x]
+    return [str(x)]
+
+# --- schema derivation ---
+def derive_flat_schema(_avro_schema_record):
+    """
+    Retorna um pyarrow.schema com:
+      source_metadata: STRUCT<schema STRING, table STRING, is_deleted BOOL, change_type STRING,
+                              tx_id INT64, lsn STRING, primary_keys ARRAY<STRING>>
+      + todos os campos do payload como STRING (payload.* promovidos ao topo)
+    Obs: ignora demais campos CDC (uuid, read_timestamp, etc.) propositalmente.
+    """
+    import pyarrow as pa
+
+    # source_metadata fixo
+    src_meta_struct = pa.struct([
+        pa.field("schema", pa.string()),
+        pa.field("table", pa.string()),
+        pa.field("is_deleted", pa.bool_()),
+        pa.field("change_type", pa.string()),
+        pa.field("tx_id", pa.int64()),
+        pa.field("lsn", pa.string()),
+        pa.field("primary_keys", pa.list_(pa.string())),
+    ])
+
+    # descobrir os campos de payload no Avro (union ["null", record] ou record)
+    payload_node = None
+    for f in _avro_schema_record.get("fields", []):
+        if f.get("name") == "payload":
+            payload_node = f.get("type")
+            break
+
+    payload_fields = []
+    def _non_null_types(u):
+        return [x for x in u if not (isinstance(x, str) and x == "null")]
+
+    record = None
+    if isinstance(payload_node, dict) and payload_node.get("type") == "record":
+        record = payload_node
+    elif isinstance(payload_node, list):
+        for t in _non_null_types(payload_node):
+            if isinstance(t, dict) and t.get("type") == "record":
+                record = t
+                break
+
+    if record:
+        for pf in record.get("fields", []):
+            payload_fields.append(pa.field(pf["name"], pa.string(), nullable=True))
+
+    # monta schema final: source_metadata + payload.*
+    fields = [pa.field("source_metadata", src_meta_struct, nullable=True)]
+    fields.extend(payload_fields)
+    return pa.schema(fields)
+
+# --- data flattening ---
+def flatten_rows_source_meta_and_payload(rows):
+    """
+    Converte cada linha Avro em:
+      { source_metadata: {...}, <payload_field1>: "str", <payload_field2>: "str", ... }
+    """
+    flat = []
+    for r in rows:
+        sm = r.get("source_metadata") or {}
+        flat.append({
+            "source_metadata": {
+                "schema": str(sm.get("schema")) if sm.get("schema") is not None else None,
+                "table": str(sm.get("table")) if sm.get("table") is not None else None,
+                "is_deleted": _to_bool(sm.get("is_deleted")),
+                "change_type": str(sm.get("change_type")) if sm.get("change_type") is not None else None,
+                "tx_id": None if sm.get("tx_id") is None else _to_int(sm.get("tx_id")),
+                "lsn": str(sm.get("lsn")) if sm.get("lsn") is not None else None,
+                "primary_keys": _to_list_of_str(sm.get("primary_keys")),
+            },
+            # payload.* promovido para topo como STRING
+            **({
+                k: _stringify_any(v)
+                for k, v in (r.get("payload") or {}).items()
+            })
+        })
+    return flat
+
 def parse_duration_to_seconds(text: str) -> int:
     m = re.fullmatch(r"(?i)\s*(\d+)\s*([smhd])\s*", text.strip())
     if not m:
@@ -217,33 +333,20 @@ class AvroPathLogPyArrowSchema(beam.DoFn):
         logging.info("[AVRO-SCHEMA] ingestion_date=%s schema=%s", ingestion_date, schema_json)
         logging.info("[AVRO-SCHEMA] example_file=%s", path)
 
-        # Converte para PyArrow (payload.* => string)
-        pa_schema = avro_schema_json_to_pyarrow_schema(avro_schema)
-        logging.info("[PYARROW-SCHEMA] file=%s\n%s", path, pa_schema)
+        # --- derivar schema flat (source_metadata + payload.*) ---
+        pa_schema = derive_flat_schema(avro_schema)
+        logging.info("[PYARROW-SCHEMA-FLAT] file=%s\n%s", path, pa_schema)
 
-        # Reabre e lê registros Avro
+        # --- ler novamente os registros ---
         with FileSystems.open(path) as f2:
             rdr2 = fastavro.reader(f2)
             rows = [dict(r) for r in rdr2]
 
-        # Normaliza payload para strings
-        _normalize_payload_values_to_string(rows)
+        # --- desestruturar: source_metadata + payload.* ---
+        flat_rows = flatten_rows_source_meta_and_payload(rows)
 
-        #DEBUG: identifica campo com tipo Arrow incompatível com o valor Python
-        for f in pa_schema:
-            sample = next((r.get(f.name) for r in rows if r.get(f.name) is not None), None)
-            if sample is None:
-                continue
-            import pyarrow as pa
-            if pa.types.is_binary(f.type) and not isinstance(sample, (bytes, bytearray)):
-                logging.warning("MISMATCH field=%s expected=%s got_py=%s value=%r", f.name, f.type, type(sample).__name__, sample)
-            if pa.types.is_string(f.type) and not isinstance(sample, str):
-                logging.warning("MISMATCH field=%s expected=%s got_py=%s value=%r", f.name, f.type, type(sample).__name__, sample)
-
-
-        # Cria Tabela Arrow com o schema calculado
         try:
-            table = pa.Table.from_pylist(rows, schema=pa_schema)
+            table = pa.Table.from_pylist(flat_rows, schema=pa_schema)
         except Exception as e:
             logging.exception("Falha ao construir Table com schema calculado: %s", e)
             # Probe por coluna para identificar onde quebra
