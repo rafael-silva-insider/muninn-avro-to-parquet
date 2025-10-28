@@ -57,7 +57,7 @@ def derive_flat_schema(_avro_schema_record):
     Retorna um pyarrow.schema com:
       source_metadata: STRUCT<schema STRING, table STRING, is_deleted BOOL, change_type STRING,
                               tx_id INT64, lsn STRING, primary_keys ARRAY<STRING>>
-      + todos os campos do payload como STRING (payload.* promovidos ao topo)
+      + todos os campos do payload com tipos primitivos corretos (payload.* promovidos ao topo)
     Obs: ignora demais campos CDC (uuid, read_timestamp, etc.) propositalmente.
     """
     import pyarrow as pa
@@ -95,7 +95,12 @@ def derive_flat_schema(_avro_schema_record):
 
     if record:
         for pf in record.get("fields", []):
-            payload_fields.append(pa.field(pf["name"], pa.string(), nullable=True))
+            field_name = pf["name"]
+            field_type = pf["type"]
+            
+            # Converte o tipo Avro para PyArrow corretamente
+            pa_type, nullable = _pyarrow_type_from_node(field_type, field_name=field_name)
+            payload_fields.append(pa.field(field_name, pa_type, nullable=nullable))
 
     # monta schema final: source_metadata + payload.*
     fields = [pa.field("source_metadata", src_meta_struct, nullable=True)]
@@ -103,15 +108,15 @@ def derive_flat_schema(_avro_schema_record):
     return pa.schema(fields)
 
 # --- data flattening ---
-def flatten_rows_source_meta_and_payload(rows):
+def flatten_rows_source_meta_and_payload(rows, payload_schema_fields):
     """
     Converte cada linha Avro em:
-      { source_metadata: {...}, <payload_field1>: "str", <payload_field2>: "str", ... }
+      { source_metadata: {...}, <payload_field1>: value_with_correct_type, <payload_field2>: value_with_correct_type, ... }
     """
     flat = []
     for r in rows:
         sm = r.get("source_metadata") or {}
-        flat.append({
+        flat_row = {
             "source_metadata": {
                 "schema": str(sm.get("schema")) if sm.get("schema") is not None else None,
                 "table": str(sm.get("table")) if sm.get("table") is not None else None,
@@ -120,14 +125,106 @@ def flatten_rows_source_meta_and_payload(rows):
                 "tx_id": None if sm.get("tx_id") is None else _to_int(sm.get("tx_id")),
                 "lsn": str(sm.get("lsn")) if sm.get("lsn") is not None else None,
                 "primary_keys": _to_list_of_str(sm.get("primary_keys")),
-            },
-            # payload.* promovido para topo como STRING
-            **({
-                k: _stringify_any(v)
-                for k, v in (r.get("payload") or {}).items()
-            })
-        })
+            }
+        }
+        
+        # payload.* promovido para topo com tipos corretos
+        payload = r.get("payload") or {}
+        for field_name, field_value in payload.items():
+            # Encontra o tipo esperado para este campo no schema
+            expected_type = None
+            for schema_field in payload_schema_fields:
+                if schema_field.name == field_name:
+                    expected_type = schema_field.type
+                    break
+            
+            # Converte o valor para o tipo correto
+            flat_row[field_name] = _convert_value_to_pyarrow_type(field_value, expected_type)
+        
+        flat.append(flat_row)
     return flat
+
+def _convert_value_to_pyarrow_type(value, pa_type):
+    """Converte um valor para o tipo PyArrow esperado"""
+    import pyarrow as pa
+    from datetime import date, datetime
+    import decimal
+    
+    if value is None:
+        return None
+    
+    # Se o tipo é timestamp, converte adequadamente
+    if pa.types.is_timestamp(pa_type):
+        if isinstance(value, (int, float)):
+            # Assume que é timestamp em millis ou micros
+            return value
+        return value
+    
+    # Se o tipo é date
+    if pa.types.is_date(pa_type):
+        if isinstance(value, int):
+            # Avro date é dias desde epoch (1970-01-01)
+            return value
+        return value
+    
+    # Se o tipo é decimal, mantém como está (será tratado pelo PyArrow)
+    if pa.types.is_decimal(pa_type):
+        if isinstance(value, bytes):
+            # Decimal em Avro pode vir como bytes - converte para decimal
+            try:
+                # Converte bytes para decimal usando a precisão/escala do tipo
+                precision = pa_type.precision
+                scale = pa_type.scale
+                # Converte bytes para int primeiro, depois ajusta pela escala
+                int_val = int.from_bytes(value, byteorder='big', signed=True)
+                decimal_val = decimal.Decimal(int_val) / (decimal.Decimal(10) ** scale)
+                return float(decimal_val)  # Converte para float para compatibilidade
+            except Exception:
+                return None
+        elif isinstance(value, (int, float)):
+            return float(value)
+        return value
+    
+    # Se o tipo é inteiro
+    if pa.types.is_integer(pa_type):
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return None
+    
+    # Se o tipo é float
+    if pa.types.is_floating(pa_type):
+        if value is None:
+            return None
+        
+        # Tratamento especial para valores decimais que vêm como bytes
+        if isinstance(value, bytes):
+            try:
+                # Converte bytes decimais para float
+                int_val = int.from_bytes(value, byteorder='big', signed=True)
+                # Assume escala padrão se não especificada
+                decimal_val = decimal.Decimal(int_val) / (decimal.Decimal(10) ** 30)  # escala comum dos decimais
+                return float(decimal_val)
+            except Exception:
+                return None
+        
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+    
+    # Se o tipo é boolean
+    if pa.types.is_boolean(pa_type):
+        return _to_bool(value)
+    
+    # Se o tipo é string ou outros, converte para string
+    if pa.types.is_string(pa_type) or pa.types.is_binary(pa_type):
+        return _stringify_any(value)
+    
+    # Default: converte para string
+    return _stringify_any(value)
 
 def parse_duration_to_seconds(text: str) -> int:
     m = re.fullmatch(r"(?i)\s*(\d+)\s*([smhd])\s*", text.strip())
@@ -149,6 +246,49 @@ def _base_type(node):
         return node.get("type")
     return None
 
+def _pa_from_primitive(prim: str):
+    import pyarrow as pa
+    return {
+        "string": pa.string(),
+        "boolean": pa.bool_(),
+        "int": pa.int32(),
+        "long": pa.int64(),
+        "float": pa.float32(),
+        "double": pa.float64(),
+        "bytes": pa.binary(),
+        "null": pa.string(),  # fallback amigável
+    }.get(prim, pa.string())
+
+def _pa_from_logical_dict(node: dict):
+    import pyarrow as pa
+    logical = node.get("logicalType")
+    base = node.get("type")
+
+    # timestamps lógicos comuns
+    if logical == "timestamp-millis" and base in {"long", "int"}:
+        return pa.timestamp("ms")
+    if logical == "timestamp-micros" and base in {"long", "int"}:
+        return pa.timestamp("us")
+
+    # date lógico
+    if logical == "date" and base == "int":
+        return pa.date32()
+
+    # decimal lógico - ajustado para compatibilidade com BigQuery
+    if logical == "decimal":
+        precision = int(node.get("precision"))
+        scale = int(node.get("scale", 0))
+        
+        # BigQuery NUMERIC tem limite de 38 dígitos de precisão e 9 de escala
+        # Se exceder, usa FLOAT64 para evitar perda de dados
+        if precision > 38 or scale > 9:
+            return pa.float64()
+        else:
+            return pa.decimal128(precision, scale)
+
+    # fallback: usa o tipo base
+    return _pa_from_primitive(base)
+
 # ---------------- Avro-JSON -> PyArrow ----------------
 def _pyarrow_type_from_node(node, field_name=None):
     """
@@ -160,14 +300,32 @@ def _pyarrow_type_from_node(node, field_name=None):
     import pyarrow as pa
 
     # União
+    # União (regra solicitada)
     if _is_union(node):
-        non_null = _non_null_types(node)
-        if not non_null:
+        # 1) se o primeiro tipo NÃO é null => retorna STRING (conservador)
+        first = node[0] if isinstance(node, list) and node else None
+        if not (isinstance(first, str) and first == "null"):
+            import pyarrow as pa
             return pa.string(), True
-        if len(non_null) > 1:
+
+        # 2) primeiro é null
+        if len(node) < 2:
+            import pyarrow as pa
             return pa.string(), True
-        t, n = _pyarrow_type_from_node(non_null[0], field_name=field_name)
-        return t, True or n
+
+        second = node[1]
+
+        # 2.a) se o segundo é PRIMITIVO => retorna o tipo do segundo, nullable=True
+        if isinstance(second, str):
+            return _pa_from_primitive(second), True
+
+        # 2.b) se o segundo é DICT => retorna pelo logicalType (ou base), nullable=True
+        if isinstance(second, dict):
+            return _pa_from_logical_dict(second), True
+
+        # 2.c) fallback
+        import pyarrow as pa
+        return pa.string(), True
 
     # Primitivos via string
     if isinstance(node, str):
@@ -177,6 +335,7 @@ def _pyarrow_type_from_node(node, field_name=None):
         if prim == "int":     return pa.int32(), False
         if prim == "long":    return pa.int64(), False
         if prim == "float":   return pa.float32(), False
+        if prim == "decimal": return pa.float64(), False
         if prim == "double":  return pa.float64(), False
         if prim == "bytes":   return pa.binary(), False
         if prim == "null":    return pa.string(), True
@@ -336,14 +495,24 @@ class AvroPathLogPyArrowSchema(beam.DoFn):
         # --- derivar schema flat (source_metadata + payload.*) ---
         pa_schema = derive_flat_schema(avro_schema)
         logging.info("[PYARROW-SCHEMA-FLAT] file=%s\n%s", path, pa_schema)
+        
+        # Log dos tipos decimais para debug
+        for field in pa_schema:
+            if hasattr(field.type, 'precision') or str(field.type).startswith('decimal'):
+                logging.info("[DECIMAL-FIELD] field=%s type=%s", field.name, field.type)
+            elif str(field.type) == 'double':
+                logging.info("[FLOAT64-FIELD] field=%s (convertido de decimal)", field.name)
+
+        # Extrair apenas os campos de payload do schema para conversão de tipos
+        payload_schema_fields = [f for f in pa_schema if f.name != "source_metadata"]
 
         # --- ler novamente os registros ---
         with FileSystems.open(path) as f2:
             rdr2 = fastavro.reader(f2)
             rows = [dict(r) for r in rdr2]
 
-        # --- desestruturar: source_metadata + payload.* ---
-        flat_rows = flatten_rows_source_meta_and_payload(rows)
+        # --- desestruturar: source_metadata + payload.* com tipos corretos ---
+        flat_rows = flatten_rows_source_meta_and_payload(rows, payload_schema_fields)
 
         try:
             table = pa.Table.from_pylist(flat_rows, schema=pa_schema)
@@ -352,7 +521,7 @@ class AvroPathLogPyArrowSchema(beam.DoFn):
             # Probe por coluna para identificar onde quebra
             import pyarrow as pa
             for f in pa_schema:
-                col_vals = [r.get(f.name) for r in rows]
+                col_vals = [r.get(f.name) for r in flat_rows]
                 sample = next((v for v in col_vals if v is not None), None)
                 try:
                     # tente materializar apenas essa coluna com o tipo esperado
@@ -362,7 +531,33 @@ class AvroPathLogPyArrowSchema(beam.DoFn):
                         "COLUNA PROBLEMÁTICA: '%s' | arrow_type=%s | sample_type=%s | sample_value=%r | erro=%r",
                         f.name, f.type, type(sample).__name__ if sample is not None else None, sample, fe
                     )
-            raise  # repropaga para o Dataflow marcar a falha
+            
+            # Tenta criar uma versão mais permissiva do schema (todos como string quando falha)
+            logging.warning("Tentando criar schema com tipos string como fallback...")
+            try:
+                fallback_fields = []
+                for f in pa_schema:
+                    if f.name == "source_metadata":
+                        fallback_fields.append(f)  # Mantém source_metadata como struct
+                    else:
+                        fallback_fields.append(pa.field(f.name, pa.string(), nullable=True))
+                
+                fallback_schema = pa.schema(fallback_fields)
+                
+                # Converte valores problemáticos para string
+                fallback_rows = []
+                for row in flat_rows:
+                    fallback_row = {"source_metadata": row.get("source_metadata")}
+                    for key, value in row.items():
+                        if key != "source_metadata":
+                            fallback_row[key] = _stringify_any(value)
+                    fallback_rows.append(fallback_row)
+                
+                table = pa.Table.from_pylist(fallback_rows, schema=fallback_schema)
+                logging.warning("Sucesso com schema fallback (tipos string)")
+            except Exception as fe:
+                logging.error("Falha mesmo com schema fallback: %s", fe)
+                raise  # repropaga para o Dataflow marcar a falha
         
         # extrai a pasta imediatamente após "avro/"
         m = re.search(r'/avro/([^/]+)/', path)
