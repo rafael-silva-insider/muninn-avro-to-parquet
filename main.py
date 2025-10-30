@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import apache_beam as beam
 from apache_beam.io import fileio
 from apache_beam.io.filesystems import FileSystems
-from apache_beam.options.pipeline_options import PipelineOptions, SetupOptions
+from apache_beam.options.pipeline_options import PipelineOptions, SetupOptions, StandardOptions
 from apache_beam.transforms.window import FixedWindows
 
 # ---------------- util: parse "30m", "1h", "2d" ----------------
@@ -167,23 +167,36 @@ def _convert_value_to_pyarrow_type(value, pa_type):
             return value
         return value
     
-    # Se o tipo é decimal, mantém como está (será tratado pelo PyArrow)
+    # Se o tipo é decimal, converte adequadamente para DECIMAL128
     if pa.types.is_decimal(pa_type):
         if isinstance(value, bytes):
-            # Decimal em Avro pode vir como bytes - converte para decimal
+            # Decimal em Avro vem como bytes - converte para Decimal Python
             try:
-                # Converte bytes para decimal usando a precisão/escala do tipo
-                precision = pa_type.precision
-                scale = pa_type.scale
-                # Converte bytes para int primeiro, depois ajusta pela escala
+                # Obtém a escala original do Avro (geralmente 30)
+                # Precisamos descobrir a escala original para converter corretamente
+                # Avro decimal com scale=30 vem como bytes
                 int_val = int.from_bytes(value, byteorder='big', signed=True)
-                decimal_val = decimal.Decimal(int_val) / (decimal.Decimal(10) ** scale)
-                return float(decimal_val)  # Converte para float para compatibilidade
-            except Exception:
-                return None
+                
+                # Converte assumindo escala original de 30 (comum nos seus dados)
+                original_scale = 30
+                decimal_val = decimal.Decimal(int_val) / (decimal.Decimal(10) ** original_scale)
+                
+                # Reescala para target scale=9 (BigQuery NUMERIC)
+                target_scale = 9
+                rescaled_val = decimal_val.quantize(decimal.Decimal(10) ** -target_scale)
+                
+                return rescaled_val
+            except Exception as e:
+                # Se falhar, tenta converter como zero
+                return decimal.Decimal('0.000000000')
         elif isinstance(value, (int, float)):
-            return float(value)
-        return value
+            # Converte números para Decimal com escala 9
+            decimal_val = decimal.Decimal(str(value))
+            return decimal_val.quantize(decimal.Decimal('0.000000000'))
+        elif isinstance(value, decimal.Decimal):
+            # Já é Decimal, apenas reescala para 9 casas decimais
+            return value.quantize(decimal.Decimal('0.000000000'))
+        return decimal.Decimal('0.000000000')
     
     # Se o tipo é inteiro
     if pa.types.is_integer(pa_type):
@@ -274,17 +287,10 @@ def _pa_from_logical_dict(node: dict):
     if logical == "date" and base == "int":
         return pa.date32()
 
-    # decimal lógico - ajustado para compatibilidade com BigQuery
+    # decimal lógico - converte para DECIMAL128 (P=38, S=9) compatível com BigQuery NUMERIC
     if logical == "decimal":
-        precision = int(node.get("precision"))
-        scale = int(node.get("scale", 0))
-        
-        # BigQuery NUMERIC tem limite de 38 dígitos de precisão e 9 de escala
-        # Se exceder, usa FLOAT64 para evitar perda de dados
-        if precision > 38 or scale > 9:
-            return pa.float64()
-        else:
-            return pa.decimal128(precision, scale)
+        # Força precisão/escala compatível com BigQuery NUMERIC (max 38 dígitos, 9 decimais)
+        return pa.decimal128(precision=38, scale=9)
 
     # fallback: usa o tipo base
     return _pa_from_primitive(base)
@@ -498,10 +504,11 @@ class AvroPathLogPyArrowSchema(beam.DoFn):
         
         # Log dos tipos decimais para debug
         for field in pa_schema:
-            if hasattr(field.type, 'precision') or str(field.type).startswith('decimal'):
-                logging.info("[DECIMAL-FIELD] field=%s type=%s", field.name, field.type)
+            if hasattr(field.type, 'precision') and pa.types.is_decimal(field.type):
+                logging.info("[DECIMAL-FIELD] field=%s type=decimal128(%d,%d)", 
+                           field.name, field.type.precision, field.type.scale)
             elif str(field.type) == 'double':
-                logging.info("[FLOAT64-FIELD] field=%s (convertido de decimal)", field.name)
+                logging.info("[FLOAT64-FIELD] field=%s (unexpected float)", field.name)
 
         # Extrair apenas os campos de payload do schema para conversão de tipos
         payload_schema_fields = [f for f in pa_schema if f.name != "source_metadata"]
@@ -583,6 +590,10 @@ def run(argv=None):
 
     pipeline_options = PipelineOptions(pipeline_args)
     pipeline_options.view_as(SetupOptions).save_main_session = True
+    
+    # Enable streaming mode for continuous processing
+    pipeline_options.view_as(StandardOptions).streaming = True
+    
     logging.getLogger().setLevel(logging.INFO)
 
     win_seconds = parse_duration_to_seconds(known_args.window_duration)
@@ -590,8 +601,13 @@ def run(argv=None):
     with beam.Pipeline(options=pipeline_options) as p:
         (
             p
-            | "Match AVRO files" >> fileio.MatchFiles(known_args.input_pattern)
-            | "To path" >> beam.Map(lambda m: m.path)
+            | "Match AVRO files continuously" >> fileio.MatchContinuously(
+                file_pattern=known_args.input_pattern,
+                interval=win_seconds,  # Poll every window_duration seconds
+                has_deduplication=True  # Avoid reprocessing same files
+            )
+            | "Read matches" >> fileio.ReadMatches()
+            | "Extract path" >> beam.Map(lambda readable_file: readable_file.metadata.path)
             | "Window" >> beam.WindowInto(FixedWindows(win_seconds))
             | "Avro → PyArrow Schema (log) + Parquet" >> beam.ParDo(AvroPathLogPyArrowSchema(known_args.output_prefix))
         )
